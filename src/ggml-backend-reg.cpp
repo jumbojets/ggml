@@ -62,6 +62,10 @@
 #include "ggml-hexagon.h"
 #endif
 
+#ifdef GGML_USE_APPLEAMX
+#include "ggml-appleamx.h"
+#endif
+
 #ifdef GGML_USE_BLAS
 #include "ggml-blas.h"
 #endif
@@ -155,6 +159,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_CANN
         register_backend(ggml_backend_cann_reg());
+#endif
+#ifdef GGML_USE_APPLEAMX
+        register_backend(ggml_backend_appleamx_reg());
 #endif
 #ifdef GGML_USE_BLAS
         register_backend(ggml_backend_blas_reg());
@@ -575,6 +582,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     bool silent = false;
 #endif
 
+    ggml_backend_load_best("appleamx", silent, dir_path);
     ggml_backend_load_best("blas", silent, dir_path);
     ggml_backend_load_best("zendnn", silent, dir_path);
     ggml_backend_load_best("cann", silent, dir_path);
