@@ -72,7 +72,9 @@ since those backends cannot read repacked weights.
 
 ### Limitations
 
-- Only tested on an M1 Max. AMX is undocumented, and it is unknown whether M4 and later still support it.
+- Only tested on an M1 Max. AMX is undocumented, and it is unknown whether M4 and later still support it. AMX is
+  probed once at startup: on CPUs without it, the `CPU_APPLEAMX` buffer type and the `AppleAMX` device are not
+  registered and the plain CPU paths are used. Set `GGML_APPLEAMX_DISABLE=1` to turn it off explicitly.
 - `CPU_APPLEAMX` does not pack Q2_K, Q3_K, the IQ types, BF16, F32 and the microscaling formats yet; those weights
   stay on the CPU.
 - Packed weights cannot be read back from the buffer.

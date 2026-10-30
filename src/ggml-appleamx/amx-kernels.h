@@ -11,19 +11,73 @@
 //
 // Threads that use these kernels must enable AMX with AMX_SET() first and
 // disable it with AMX_CLR() when they are done.
+//
+// AMX is undocumented and not guaranteed to exist on every Apple chip:
+// check amx_available() before using any of it.
 
 #pragma once
 
 #include "ggml.h"
+#include "ggml-impl.h"
 #include "amx.h"
 
 #include <arm_neon.h>
 
+#include <csetjmp>
+#include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #define AMX_TILE      32  // rows of a packed panel, size of an output tile
 #define AMX_ALIGNMENT 128 // pair loads need 128-byte alignment
+
+//
+// availability
+//
+
+// returns true if fn runs without raising SIGILL
+static inline bool amx_runs_without_sigill(void (*fn)(void)) {
+    static sigjmp_buf jmp;
+
+    struct sigaction sa  = {};
+    struct sigaction old = {};
+    sa.sa_handler = [](int) { siglongjmp(jmp, 1); };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGILL, &sa, &old);
+
+    volatile bool ok = false;
+    if (sigsetjmp(jmp, 1) == 0) {
+        fn();
+        ok = true;
+    }
+
+    sigaction(SIGILL, &old, nullptr);
+    return ok;
+}
+
+static inline void amx_probe(void) {
+    AMX_SET();
+    AMX_CLR();
+}
+
+// whether the AMX coprocessor can be used, probed once
+// set GGML_APPLEAMX_DISABLE=1 to disable it
+static inline bool amx_available(void) {
+    static const bool available = []() {
+        const char * env = getenv("GGML_APPLEAMX_DISABLE");
+        if (env && atoi(env) != 0) {
+            GGML_LOG_INFO("amx_available: Apple AMX disabled by GGML_APPLEAMX_DISABLE\n");
+            return false;
+        }
+        if (!amx_runs_without_sigill(amx_probe)) {
+            GGML_LOG_WARN("amx_available: Apple AMX is not supported by this CPU, it will not be used\n");
+            return false;
+        }
+        return true;
+    }();
+    return available;
+}
 
 //
 // packing

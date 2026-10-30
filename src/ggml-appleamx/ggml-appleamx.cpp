@@ -413,6 +413,10 @@ static ggml_guid_t ggml_backend_appleamx_guid(void) {
 }
 
 ggml_backend_t ggml_backend_appleamx_init(void) {
+    if (!amx_available()) {
+        return nullptr;
+    }
+
     ggml_backend_appleamx_context * ctx = new ggml_backend_appleamx_context;
 
     ggml_backend_t backend = new ggml_backend {
@@ -586,13 +590,14 @@ static const char * ggml_backend_appleamx_reg_get_name(ggml_backend_reg_t reg) {
 }
 
 static size_t ggml_backend_appleamx_reg_get_device_count(ggml_backend_reg_t reg) {
-    return 1;
+    // no device on CPUs without AMX
+    return amx_available() ? 1 : 0;
 
     GGML_UNUSED(reg);
 }
 
 static ggml_backend_dev_t ggml_backend_appleamx_reg_get_device(ggml_backend_reg_t reg, size_t index) {
-    GGML_ASSERT(index == 0);
+    GGML_ASSERT(index < ggml_backend_appleamx_reg_get_device_count(reg));
 
     static ggml_backend_device ggml_backend_appleamx_device = {
         /* .iface   = */ ggml_backend_appleamx_device_i,

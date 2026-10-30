@@ -99,7 +99,12 @@ int main(int argc, char ** argv) {
     ggml_backend_t cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(cpu, 8);
     ggml_backend_buffer_type_t buft = find_extra_buft("CPU_APPLEAMX");
-    if (!buft) { printf("CPU_APPLEAMX buffer type not found\n"); return 1; }
+    if (!buft) {
+        // AMX not supported by this CPU or disabled with GGML_APPLEAMX_DISABLE
+        printf("CPU_APPLEAMX buffer type not available, skipping\n");
+        ggml_backend_free(cpu);
+        return 0;
+    }
 
     const ggml_type types[] = { GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 };
     int n_fail = 0, n_tests = 0;

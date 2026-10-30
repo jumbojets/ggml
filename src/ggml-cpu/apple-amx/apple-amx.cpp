@@ -1130,6 +1130,10 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
 ggml_backend_buffer_type_t ggml_backend_cpu_appleamx_buffer_type(void) {
     using namespace ggml::cpu::appleamx;
 
+    if (!amx_available()) {
+        return nullptr;
+    }
+
     static struct ggml_backend_buffer_type buffer_type = {
         /* .iface = */ {
             /* .get_name         = */ buffer_type_get_name,
