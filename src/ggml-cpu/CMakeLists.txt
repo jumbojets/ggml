@@ -627,6 +627,13 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_REPACK)
     endif()
 
+    if (GGML_APPLEAMX AND APPLE AND GGML_SYSTEM_ARCH STREQUAL "ARM")
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_APPLEAMX)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/apple-amx/apple-amx.cpp
+            ggml-cpu/apple-amx/apple-amx.h)
+    endif()
+
     if (GGML_CPU_KLEIDIAI)
         # upstream repo requires at least cmake 3.16
         if (CMAKE_VERSION VERSION_LESS 3.16)
