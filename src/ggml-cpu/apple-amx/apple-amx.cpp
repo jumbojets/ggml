@@ -2,15 +2,25 @@
 //
 // MUL_MAT weights are packed once, when they are loaded, into panels of 32 rows:
 //
-//  - F16:              k-major f16 panels [kp][32], the layout the AMX kernels consume
-//  - Q4_0, Q4_1, Q4_K: per block of 32 k values, 4-bit quants followed by 32 f16 scales
-//                      and, except for Q4_0, 32 f16 mins: w = s*q + m (Q4_0: w = s*(q - 8))
-//  - Q8_0:             per block of 32 k values, int8 quants followed by 32 f16 scales: w = s*q
+//  - F16: k-major f16 panels [kp][32], the layout the AMX kernels consume
+//  - quantized types: per block of 32 k values, the quants followed by 32 f16 scales per row and,
+//    depending on the type, a second set of scales or 32 f16 mins
+//
+//    type        quants        decoded weight               bits per weight
+//    Q4_0        4-bit         w = s*(q - 8)                4.5
+//    Q4_1, Q4_K  4-bit         w = s*q + m                  5
+//    Q5_0        4 + 1 bits    w = s*(q - 16)               5.5
+//    Q5_1, Q5_K  4 + 1 bits    w = s*q + m                  6
+//    Q6_K        4 + 2 bits    w = s*(q - 32), with separate scales for k [0, 16) and [16, 32)   7
+//    Q8_0        8-bit         w = s*q                      8.5
 //
 // The quants of a block are stored in 8 groups of 4 consecutive k values, row by row:
-//  - 4-bit: 64 bytes per group, byte 4*r + kk holds row r in the low and row r + 16 in the high nibble
+//  - 4-bit: 64 bytes per group, byte 4*r + kk holds row r in the low and row r + 16 in the high nibble,
+//    so that the 16-byte vector v of a group holds the rows [4*v, 4*v + 4) x 4 k values
+//  - higher bits: 1 or 2 bit planes of 16 bytes per group after the 4-bit quants; bit v of byte b of
+//    plane h is bit 4 + h of the element b of vector v
 //  - 8-bit: 128 bytes per group, byte 4*r + kk holds row r
-// so that a 16-byte vector holds 4 rows x 4 k values, ready for the NEON dot product instructions,
+// so that the decoded vectors are ready for the NEON dot product instructions,
 // and vld4 de-interleaves a group into k-major vectors for the AMX panels.
 //
 // Small batches are computed with NEON dot products against int8 quantized activations.
@@ -50,13 +60,33 @@ namespace ggml::cpu::appleamx {
 enum format {
     FORMAT_NONE,
     FORMAT_F16,
-    FORMAT_Q4,
-    FORMAT_Q8,
+    FORMAT_Q,   // quantized, see kind
 };
+
+// packed quantized formats
+enum kind {
+    KIND_Q4,    // Q4_0
+    KIND_Q4M,   // Q4_1, Q4_K
+    KIND_Q5,    // Q5_0
+    KIND_Q5M,   // Q5_1, Q5_K
+    KIND_Q6,    // Q6_K
+    KIND_Q8,    // Q8_0
+};
+
+static constexpr bool kind_q8     (kind k) { return k == KIND_Q8; }
+static constexpr int  kind_nhi    (kind k) { return k == KIND_Q5 || k == KIND_Q5M ? 1 : k == KIND_Q6 ? 2 : 0; } // high bit planes
+static constexpr bool kind_has_min(kind k) { return k == KIND_Q4M || k == KIND_Q5M; }
+static constexpr bool kind_split  (kind k) { return k == KIND_Q6; }                                     // scales per half block
+static constexpr int  kind_offset (kind k) { return k == KIND_Q5 ? 16 : k == KIND_Q6 ? 32 : 0; }        // subtracted from q
+static constexpr bool kind_min8   (kind k) { return k == KIND_Q4; }                                     // implied min -8*s
+
+#define AMX_QNIB   (AMX_QK*AMX_TILE/2)                 // bytes of 4-bit quants per block
+#define AMX_QPLANE (AMX_QK*AMX_TILE/8)                 // bytes per high bit plane per block
+#define AMX_QSCALE ((size_t) AMX_TILE*sizeof(ggml_fp16_t)) // bytes per set of scales or mins
 
 struct layout {
     format  fmt        = FORMAT_NONE;
-    bool    has_min    = false;
+    kind    knd        = KIND_Q4;
     int64_t K          = 0; // row length
     int64_t M          = 0; // number of rows
     int64_t kp         = 0; // padded row length
@@ -68,6 +98,14 @@ struct layout {
     size_t size() const {
         return n_panels*panel_size;
     }
+
+    // offsets in a block of the scales of each half and of the mins
+    size_t scale_offset(int half) const {
+        return qsize + (kind_split(knd) ? half : 0)*AMX_QSCALE;
+    }
+    size_t min_offset() const {
+        return qsize + (kind_split(knd) ? 2 : 1)*AMX_QSCALE;
+    }
 };
 
 static layout get_layout(const struct ggml_tensor * t) {
@@ -77,13 +115,19 @@ static layout get_layout(const struct ggml_tensor * t) {
         return l;
     }
 
+    l.fmt = FORMAT_Q;
     switch (t->type) {
-        case GGML_TYPE_F16:  l.fmt = FORMAT_F16; break;
-        case GGML_TYPE_Q4_0: l.fmt = FORMAT_Q4;  break;
+        case GGML_TYPE_F16:  l.fmt = FORMAT_F16;  break;
+        case GGML_TYPE_Q4_0: l.knd = KIND_Q4;     break;
         case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q4_K: l.fmt = FORMAT_Q4;  l.has_min = true; break;
-        case GGML_TYPE_Q8_0: l.fmt = FORMAT_Q8;  break;
+        case GGML_TYPE_Q4_K: l.knd = KIND_Q4M;    break;
+        case GGML_TYPE_Q5_0: l.knd = KIND_Q5;     break;
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q5_K: l.knd = KIND_Q5M;    break;
+        case GGML_TYPE_Q6_K: l.knd = KIND_Q6;     break;
+        case GGML_TYPE_Q8_0: l.knd = KIND_Q8;     break;
         default:
+            l.fmt = FORMAT_NONE;
             return l;
     }
 
@@ -98,8 +142,8 @@ static layout get_layout(const struct ggml_tensor * t) {
         // the row length of these types is a multiple of their block size, itself a multiple of AMX_QK
         GGML_ASSERT(l.K % AMX_QK == 0);
         l.kp         = l.K;
-        l.qsize      = AMX_QK*AMX_TILE/(l.fmt == FORMAT_Q4 ? 2 : 1);
-        l.block_size = l.qsize + AMX_TILE*sizeof(ggml_fp16_t)*(l.has_min ? 2 : 1);
+        l.qsize      = kind_q8(l.knd) ? 2*AMX_QNIB : AMX_QNIB + kind_nhi(l.knd)*AMX_QPLANE;
+        l.block_size = l.min_offset() + (kind_has_min(l.knd) ? AMX_QSCALE : 0);
         l.panel_size = (l.K/AMX_QK)*l.block_size;
     }
 
@@ -133,8 +177,10 @@ static inline void get_scale_min_k4(int j, const uint8_t * q, uint8_t * d, uint8
     }
 }
 
-// quants, scale and min of the block ib (of AMX_QK k values) of a row
-static void extract_block(enum ggml_type type, const void * row, int64_t ib, int8_t * q, float & s, float & m) {
+// quants, scales and min of the block ib (of AMX_QK k values) of a row
+// the quants of Q5_0 and Q6_K are returned without their offset
+// s1 is the scale of the second half of the block, only different from s for Q6_K
+static void extract_block(enum ggml_type type, const void * row, int64_t ib, int8_t * q, float & s, float & s1, float & m) {
     m = 0.0f;
     switch (type) {
         case GGML_TYPE_Q4_0:
@@ -175,9 +221,64 @@ static void extract_block(enum ggml_type type, const void * row, int64_t ib, int
                 memcpy(q, b->qs, 32);
                 s = fp16_to_fp32(b->d);
             } break;
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+            {
+                const uint8_t * qh_p;
+                const uint8_t * qs;
+                if (type == GGML_TYPE_Q5_0) {
+                    const block_q5_0 * b = (const block_q5_0 *) row + ib;
+                    qh_p = b->qh;
+                    qs   = b->qs;
+                    s    = fp16_to_fp32(b->d);
+                } else {
+                    const block_q5_1 * b = (const block_q5_1 *) row + ib;
+                    qh_p = b->qh;
+                    qs   = b->qs;
+                    s    = fp16_to_fp32(b->GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d);
+                    m    = fp16_to_fp32(b->GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.m);
+                }
+                uint32_t qh;
+                memcpy(&qh, qh_p, sizeof(qh));
+                for (int j = 0; j < 16; j++) {
+                    q[j +  0] = (qs[j] & 0xF) | (((qh >> (j +  0)) << 4) & 0x10);
+                    q[j + 16] = (qs[j] >>  4) | (((qh >> (j + 12))     ) & 0x10);
+                }
+            } break;
+        case GGML_TYPE_Q5_K:
+            {
+                const block_q5_K * b = (const block_q5_K *) row + ib/8;
+                const int j = ib%8;
+                uint8_t sc, mn;
+                get_scale_min_k4(j, b->scales, &sc, &mn);
+                const uint8_t * qs = b->qs + 32*(j/2);
+                for (int l = 0; l < 32; l++) {
+                    q[l] = (j%2 == 0 ? qs[l] & 0xF : qs[l] >> 4) + (((b->qh[l] >> j) & 1) << 4);
+                }
+                s =  fp16_to_fp32(b->GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d)*sc;
+                m = -fp16_to_fp32(b->GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin)*mn;
+            } break;
+        case GGML_TYPE_Q6_K:
+            {
+                // a super-block holds 2 halves of 128 values, each of 4 blocks t of 32 values
+                const block_q6_K * b = (const block_q6_K *) row + ib/8;
+                const int n = (ib%8)/4;
+                const int t = ib%4;
+                const uint8_t * ql = b->ql + 64*n + (t & 1)*32;
+                const uint8_t * qh = b->qh + 32*n;
+                const int8_t  * sc = b->scales + 8*n + 2*t;
+                for (int l = 0; l < 32; l++) {
+                    q[l] = ((ql[l] >> ((t & 2) ? 4 : 0)) & 0xF) | (((qh[l] >> (2*t)) & 3) << 4);
+                }
+                const float d = fp16_to_fp32(b->d);
+                s  = d*sc[0];
+                s1 = d*sc[1];
+                return;
+            }
         default:
             GGML_ABORT("unsupported type");
     }
+    s1 = s;
 }
 
 static void pack_panel(const struct ggml_tensor * t, const layout & l, const char * src, int64_t ip) {
@@ -193,34 +294,48 @@ static void pack_panel(const struct ggml_tensor * t, const layout & l, const cha
 
     for (int64_t ib = 0; ib < l.K/AMX_QK; ib++) {
         int8_t      q[AMX_TILE][AMX_QK] = {};
-        ggml_fp16_t s[AMX_TILE]         = {};
+        ggml_fp16_t s[2][AMX_TILE]      = {};
         ggml_fp16_t m[AMX_TILE]         = {};
 
         for (int r = 0; r < nr; r++) {
-            float fs, fm;
-            extract_block(t->type, src + (i01 + r)*t->nb[1], ib, q[r], fs, fm);
-            s[r] = fp32_to_fp16(fs);
-            m[r] = fp32_to_fp16(fm);
+            float fs, fs1, fm;
+            extract_block(t->type, src + (i01 + r)*t->nb[1], ib, q[r], fs, fs1, fm);
+            s[0][r] = fp32_to_fp16(fs);
+            s[1][r] = fp32_to_fp16(fs1);
+            m[r]    = fp32_to_fp16(fm);
         }
 
         uint8_t * blk = (uint8_t *) dst + ib*l.block_size;
+        memset(blk, 0, l.qsize);
         for (int g = 0; g < AMX_QK/4; g++) {
             for (int kk = 0; kk < 4; kk++) {
                 const int k = 4*g + kk;
-                if (l.fmt == FORMAT_Q4) {
-                    for (int r = 0; r < 16; r++) {
-                        blk[64*g + 4*r + kk] = (q[r][k] & 0xF) | (q[r + 16][k] << 4);
-                    }
-                } else {
+                if (kind_q8(l.knd)) {
                     for (int r = 0; r < AMX_TILE; r++) {
                         blk[128*g + 4*r + kk] = (uint8_t) q[r][k];
+                    }
+                } else {
+                    for (int r = 0; r < 16; r++) {
+                        blk[64*g + 4*r + kk] = (q[r][k] & 0xF) | ((q[r + 16][k] & 0xF) << 4);
+                    }
+                }
+            }
+            // element b of vector v is row 4*v + b/4, k value 4*g + b%4
+            for (int h = 0; h < kind_nhi(l.knd); h++) {
+                uint8_t * plane = blk + AMX_QNIB + h*AMX_QPLANE + 16*g;
+                for (int b = 0; b < 16; b++) {
+                    for (int v = 0; v < 8; v++) {
+                        plane[b] |= ((q[4*v + b/4][4*g + b%4] >> (4 + h)) & 1) << v;
                     }
                 }
             }
         }
-        memcpy(blk + l.qsize, s, sizeof(s));
-        if (l.has_min) {
-            memcpy(blk + l.qsize + sizeof(s), m, sizeof(m));
+        memcpy(blk + l.scale_offset(0), s[0], sizeof(s[0]));
+        if (kind_split(l.knd)) {
+            memcpy(blk + l.scale_offset(1), s[1], sizeof(s[1]));
+        }
+        if (kind_has_min(l.knd)) {
+            memcpy(blk + l.min_offset(), m, sizeof(m));
         }
     }
 }
@@ -295,7 +410,7 @@ static void convert_row_f16(const float * x, int64_t K, int64_t kp, ggml_fp16_t 
 }
 
 // dst[j][r] = sum_k w[r][k]*x[j][k] for the NC activation rows x[j] and the rows r of a quantized panel
-template <int NC, format FMT, bool HAS_MIN>
+template <int NC, kind KIND>
 static void gemv_q(const uint8_t * panel, const layout & l, const int8_t * const * qx, const float * const * sx, const float * const * sumx, float * const * dst, int nr) {
     float32x4_t facc[NC][8];
     for (int j = 0; j < NC; j++) {
@@ -303,6 +418,11 @@ static void gemv_q(const uint8_t * panel, const layout & l, const int8_t * const
             facc[j][v] = vdupq_n_f32(0.0f);
         }
     }
+
+    constexpr int  NHI     = kind_nhi(KIND);
+    constexpr bool HAS_MIN = kind_has_min(KIND);
+    constexpr bool SPLIT   = kind_split(KIND);
+    constexpr int  OFFSET  = kind_offset(KIND);
 
     const uint8x16_t m4 = vdupq_n_u8(0xF);
 
@@ -322,15 +442,29 @@ static void gemv_q(const uint8_t * panel, const layout & l, const int8_t * const
 #define AMX_GEMV_STEP(g)                                                                    \
         {                                                                                   \
             int8x16_t w[8];                                                                 \
-            if constexpr (FMT == FORMAT_Q4) {                                               \
-                for (int q = 0; q < 4; q++) {                                               \
-                    const uint8x16_t b = vld1q_u8(blk + 64*(g) + 16*q);                     \
-                    w[q + 0] = vreinterpretq_s8_u8(vandq_u8(b, m4));                        \
-                    w[q + 4] = vreinterpretq_s8_u8(vshrq_n_u8(b, 4));                       \
-                }                                                                           \
-            } else {                                                                        \
+            if constexpr (kind_q8(KIND)) {                                                  \
                 for (int q = 0; q < 8; q++) {                                               \
                     w[q] = vld1q_s8((const int8_t *) blk + 128*(g) + 16*q);                 \
+                }                                                                           \
+            } else {                                                                        \
+                uint8x16_t u[8];                                                            \
+                for (int q = 0; q < 4; q++) {                                               \
+                    const uint8x16_t b = vld1q_u8(blk + 64*(g) + 16*q);                     \
+                    u[q + 0] = vandq_u8(b, m4);                                             \
+                    u[q + 4] = vshrq_n_u8(b, 4);                                            \
+                }                                                                           \
+                for (int h = 0; h < NHI; h++) {                                             \
+                    const uint8x16_t hb = vld1q_u8(blk + AMX_QNIB + h*AMX_QPLANE + 16*(g)); \
+                    for (int v = 0; v < 8; v++) {                                           \
+                        u[v] = vorrq_u8(u[v], vandq_u8(vshlq_u8(hb, vdupq_n_s8(4 + h - v)), \
+                                                       vdupq_n_u8(0x10 << h)));             \
+                    }                                                                       \
+                }                                                                           \
+                for (int v = 0; v < 8; v++) {                                               \
+                    w[v] = vreinterpretq_s8_u8(u[v]);                                       \
+                    if constexpr (OFFSET != 0) {                                            \
+                        w[v] = vsubq_s8(w[v], vdupq_n_s8(OFFSET));                          \
+                    }                                                                       \
                 }                                                                           \
             }                                                                               \
             if ((g) % 4 == 0) {                                                             \
@@ -345,32 +479,36 @@ static void gemv_q(const uint8_t * panel, const layout & l, const int8_t * const
             }                                                                               \
         }
 
+        // add the dot products of acc, scaled by the 32 row scales at sp, to facc and reset acc
+        auto flush = [&](const float16_t * sp) {
+            for (int v = 0; v < 8; v++) {
+                const float32x4_t s = vcvt_f32_f16(vld1_f16(sp + 4*v));
+                for (int j = 0; j < NC; j++) {
+                    facc[j][v] = vfmaq_n_f32(facc[j][v], vmulq_f32(vcvtq_f32_s32(acc[j][v]), s), sx[j][ib]);
+                    acc[j][v]  = vdupq_n_s32(0);
+                }
+            }
+        };
+
         AMX_GEMV_STEP(0) AMX_GEMV_STEP(1) AMX_GEMV_STEP(2) AMX_GEMV_STEP(3)
+        if constexpr (SPLIT) {
+            flush((const float16_t *) (blk + l.scale_offset(0)));
+        }
         AMX_GEMV_STEP(4) AMX_GEMV_STEP(5) AMX_GEMV_STEP(6) AMX_GEMV_STEP(7)
+        flush((const float16_t *) (blk + l.scale_offset(SPLIT ? 1 : 0)));
 
 #undef AMX_GEMV_STEP
 
-        const float16_t * sp = (const float16_t *) (blk + l.qsize);
-        float32x4_t s[8];
-        float32x4_t m[8];
-        for (int v = 0; v < 8; v++) {
-            s[v] = vcvt_f32_f16(vld1_f16(sp + 4*v));
-            if constexpr (HAS_MIN) {
-                m[v] = vcvt_f32_f16(vld1_f16(sp + AMX_TILE + 4*v));
-            } else if constexpr (FMT == FORMAT_Q4) {
-                m[v] = vmulq_n_f32(s[v], -8.0f);
-            }
-        }
-
-        for (int j = 0; j < NC; j++) {
-            const float dx = sx[j][ib];
+        // the mins multiply the sum of the activations of the block: Q4_0 has an implied min of -8*s
+        if constexpr (HAS_MIN || kind_min8(KIND)) {
+            const float16_t * sp = (const float16_t *) (blk + (HAS_MIN ? l.min_offset() : l.scale_offset(0)));
             for (int v = 0; v < 8; v++) {
-                facc[j][v] = vfmaq_n_f32(facc[j][v], vmulq_f32(vcvtq_f32_s32(acc[j][v]), s[v]), dx);
-            }
-            if constexpr (FMT == FORMAT_Q4) {
-                const float smx = sumx[j][ib];
-                for (int v = 0; v < 8; v++) {
-                    facc[j][v] = vfmaq_n_f32(facc[j][v], m[v], smx);
+                float32x4_t m = vcvt_f32_f16(vld1_f16(sp + 4*v));
+                if constexpr (!HAS_MIN) {
+                    m = vmulq_n_f32(m, -8.0f);
+                }
+                for (int j = 0; j < NC; j++) {
+                    facc[j][v] = vfmaq_n_f32(facc[j][v], m, sumx[j][ib]);
                 }
             }
         }
@@ -460,41 +598,57 @@ static void gemv_f16(const ggml_fp16_t * panel, int64_t kp, const ggml_fp16_t * 
 //
 
 // dequantize the blocks [ib0, ib1) of a quantized panel to an f16 panel [(ib1 - ib0)*AMX_QK][AMX_TILE]
-template <format FMT, bool HAS_MIN>
+template <kind KIND>
 static void dequantize_panel(const uint8_t * panel, const layout & l, int64_t ib0, int64_t ib1, ggml_fp16_t * out) {
+    constexpr int  NHI     = kind_nhi(KIND);
+    constexpr bool HAS_MIN = kind_has_min(KIND);
+    constexpr bool SPLIT   = kind_split(KIND);
+    constexpr int  OFFSET  = kind_offset(KIND);
+
     float16_t * o = (float16_t *) out;
+
+    // to gather the high bits of the rows r and r + 16 at k value kk of a group:
+    // byte 4*(r%4) + kk of a plane, bits r/4 and r/4 + 4
+    uint8x16_t gather[4];
+    int8x16_t  shift_lo;
+    int8x16_t  shift_hi;
+    {
+        uint8_t idx[4][16];
+        int8_t  slo[16], shi[16];
+        for (int r = 0; r < 16; r++) {
+            for (int kk = 0; kk < 4; kk++) {
+                idx[kk][r] = 4*(r%4) + kk;
+            }
+            slo[r] = 4 - r/4;
+            shi[r] =   - r/4;
+        }
+        for (int kk = 0; kk < 4; kk++) {
+            gather[kk] = vld1q_u8(idx[kk]);
+        }
+        shift_lo = vld1q_s8(slo);
+        shift_hi = vld1q_s8(shi);
+    }
 
     for (int64_t ib = ib0; ib < ib1; ib++) {
         const uint8_t * blk = panel + ib*l.block_size;
 
-        const float16_t * sp = (const float16_t *) (blk + l.qsize);
-        float16x8_t s[4];
+        // scales of each half of the block, and mins (Q4_0: -8*s)
+        float16x8_t s[2][4];
         float16x8_t m[4];
         for (int i = 0; i < 4; i++) {
-            s[i] = vld1q_f16(sp + 8*i);
+            s[0][i] = vld1q_f16((const float16_t *) (blk + l.scale_offset(0)) + 8*i);
+            s[1][i] = SPLIT ? vld1q_f16((const float16_t *) (blk + l.scale_offset(1)) + 8*i) : s[0][i];
             if constexpr (HAS_MIN) {
-                m[i] = vld1q_f16(sp + AMX_TILE + 8*i);
+                m[i] = vld1q_f16((const float16_t *) (blk + l.min_offset()) + 8*i);
             } else {
-                m[i] = vmulq_n_f16(s[i], -8.0f);
+                m[i] = vmulq_n_f16(s[0][i], -8.0f);
             }
         }
 
         for (int g = 0; g < AMX_QK/4; g++) {
-            if constexpr (FMT == FORMAT_Q4) {
-                const uint8x16x4_t b = vld4q_u8(blk + 64*g);
-                for (int kk = 0; kk < 4; kk++) {
-                    const uint8x16_t lo = vandq_u8(b.val[kk], vdupq_n_u8(0xF));
-                    const uint8x16_t hi = vshrq_n_u8(b.val[kk], 4);
-                    const uint16x8_t q[4] = {
-                        vmovl_u8(vget_low_u8(lo)), vmovl_high_u8(lo),
-                        vmovl_u8(vget_low_u8(hi)), vmovl_high_u8(hi),
-                    };
-                    float16_t * row = o + ((ib - ib0)*AMX_QK + 4*g + kk)*AMX_TILE;
-                    for (int i = 0; i < 4; i++) {
-                        vst1q_f16(row + 8*i, vfmaq_f16(m[i], vcvtq_f16_u16(q[i]), s[i]));
-                    }
-                }
-            } else {
+            const float16x8_t * sg = s[g < AMX_QK/8 ? 0 : 1];
+
+            if constexpr (kind_q8(KIND)) {
                 const int8x16x4_t b0 = vld4q_s8((const int8_t *) blk + 128*g);
                 const int8x16x4_t b1 = vld4q_s8((const int8_t *) blk + 128*g + 64);
                 for (int kk = 0; kk < 4; kk++) {
@@ -504,11 +658,78 @@ static void dequantize_panel(const uint8_t * panel, const layout & l, int64_t ib
                     };
                     float16_t * row = o + ((ib - ib0)*AMX_QK + 4*g + kk)*AMX_TILE;
                     for (int i = 0; i < 4; i++) {
-                        vst1q_f16(row + 8*i, vmulq_f16(vcvtq_f16_s16(q[i]), s[i]));
+                        vst1q_f16(row + 8*i, vmulq_f16(vcvtq_f16_s16(q[i]), sg[i]));
+                    }
+                }
+                continue;
+            }
+
+            const uint8x16x4_t b = vld4q_u8(blk + 64*g);
+            uint8x16_t hb[2];
+            for (int h = 0; h < NHI; h++) {
+                hb[h] = vld1q_u8(blk + AMX_QNIB + h*AMX_QPLANE + 16*g);
+            }
+
+            for (int kk = 0; kk < 4; kk++) {
+                // rows [0, 16) and [16, 32)
+                uint8x16_t lo = vandq_u8(b.val[kk], vdupq_n_u8(0xF));
+                uint8x16_t hi = vshrq_n_u8(b.val[kk], 4);
+                for (int h = 0; h < NHI; h++) {
+                    const uint8x16_t gb = vqtbl1q_u8(hb[h], gather[kk]);
+                    const uint8x16_t mb = vdupq_n_u8(0x10 << h);
+                    lo = vorrq_u8(lo, vandq_u8(vshlq_u8(gb, vaddq_s8(shift_lo, vdupq_n_s8(h))), mb));
+                    hi = vorrq_u8(hi, vandq_u8(vshlq_u8(gb, vaddq_s8(shift_hi, vdupq_n_s8(h))), mb));
+                }
+
+                float16x8_t q[4];
+                if constexpr (OFFSET != 0) {
+                    const int8x16_t slo = vsubq_s8(vreinterpretq_s8_u8(lo), vdupq_n_s8(OFFSET));
+                    const int8x16_t shi = vsubq_s8(vreinterpretq_s8_u8(hi), vdupq_n_s8(OFFSET));
+                    q[0] = vcvtq_f16_s16(vmovl_s8(vget_low_s8(slo)));
+                    q[1] = vcvtq_f16_s16(vmovl_high_s8(slo));
+                    q[2] = vcvtq_f16_s16(vmovl_s8(vget_low_s8(shi)));
+                    q[3] = vcvtq_f16_s16(vmovl_high_s8(shi));
+                } else {
+                    q[0] = vcvtq_f16_u16(vmovl_u8(vget_low_u8(lo)));
+                    q[1] = vcvtq_f16_u16(vmovl_high_u8(lo));
+                    q[2] = vcvtq_f16_u16(vmovl_u8(vget_low_u8(hi)));
+                    q[3] = vcvtq_f16_u16(vmovl_high_u8(hi));
+                }
+
+                float16_t * row = o + ((ib - ib0)*AMX_QK + 4*g + kk)*AMX_TILE;
+                for (int i = 0; i < 4; i++) {
+                    if constexpr (HAS_MIN || kind_min8(KIND)) {
+                        vst1q_f16(row + 8*i, vfmaq_f16(m[i], q[i], sg[i]));
+                    } else {
+                        vst1q_f16(row + 8*i, vmulq_f16(q[i], sg[i]));
                     }
                 }
             }
         }
+    }
+}
+
+// dispatch on the kind of a quantized panel
+template <int NC>
+static void gemv_q_any(const uint8_t * panel, const layout & l, const int8_t * const * qx, const float * const * sx, const float * const * sumx, float * const * dst, int nr) {
+    switch (l.knd) {
+        case KIND_Q4:  gemv_q<NC, KIND_Q4 >(panel, l, qx, sx, sumx, dst, nr); break;
+        case KIND_Q4M: gemv_q<NC, KIND_Q4M>(panel, l, qx, sx, sumx, dst, nr); break;
+        case KIND_Q5:  gemv_q<NC, KIND_Q5 >(panel, l, qx, sx, sumx, dst, nr); break;
+        case KIND_Q5M: gemv_q<NC, KIND_Q5M>(panel, l, qx, sx, sumx, dst, nr); break;
+        case KIND_Q6:  gemv_q<NC, KIND_Q6 >(panel, l, qx, sx, sumx, dst, nr); break;
+        case KIND_Q8:  gemv_q<NC, KIND_Q8 >(panel, l, qx, sx, sumx, dst, nr); break;
+    }
+}
+
+static void dequantize_panel_any(const uint8_t * panel, const layout & l, int64_t ib0, int64_t ib1, ggml_fp16_t * out) {
+    switch (l.knd) {
+        case KIND_Q4:  dequantize_panel<KIND_Q4 >(panel, l, ib0, ib1, out); break;
+        case KIND_Q4M: dequantize_panel<KIND_Q4M>(panel, l, ib0, ib1, out); break;
+        case KIND_Q5:  dequantize_panel<KIND_Q5 >(panel, l, ib0, ib1, out); break;
+        case KIND_Q5M: dequantize_panel<KIND_Q5M>(panel, l, ib0, ib1, out); break;
+        case KIND_Q6:  dequantize_panel<KIND_Q6 >(panel, l, ib0, ib1, out); break;
+        case KIND_Q8:  dequantize_panel<KIND_Q8 >(panel, l, ib0, ib1, out); break;
     }
 }
 
@@ -613,22 +834,11 @@ static void mul_mat_neon_panel(const struct ggml_tensor * op, const mul_mat_plan
                 sm[j] = sumx + (i + j)*(K/AMX_QK);
             }
 
-#define AMX_GEMV_Q(NC)                                                      \
-            if (l.fmt == FORMAT_Q8) {                                       \
-                gemv_q<NC, FORMAT_Q8, false>(panel, l, q, s, sm, d, nr);    \
-            } else if (l.has_min) {                                         \
-                gemv_q<NC, FORMAT_Q4, true >(panel, l, q, s, sm, d, nr);    \
-            } else {                                                        \
-                gemv_q<NC, FORMAT_Q4, false>(panel, l, q, s, sm, d, nr);    \
-            }
-
             if (nc == 2) {
-                AMX_GEMV_Q(2)
+                gemv_q_any<2>(panel, l, q, s, sm, d, nr);
             } else {
-                AMX_GEMV_Q(1)
+                gemv_q_any<1>(panel, l, q, s, sm, d, nr);
             }
-
-#undef AMX_GEMV_Q
         }
 
         i += nc;
@@ -732,13 +942,7 @@ static void mul_mat_amx(struct ggml_compute_params * params, struct ggml_tensor 
             } else {
                 const int64_t ib0 = k0/AMX_QK;
                 const int64_t ib1 = ib0 + knp/AMX_QK;
-                if (l.fmt == FORMAT_Q8) {
-                    dequantize_panel<FORMAT_Q8, false>(panel, l, ib0, ib1, wpanel);
-                } else if (l.has_min) {
-                    dequantize_panel<FORMAT_Q4, true >(panel, l, ib0, ib1, wpanel);
-                } else {
-                    dequantize_panel<FORMAT_Q4, false>(panel, l, ib0, ib1, wpanel);
-                }
+                dequantize_panel_any(panel, l, ib0, ib1, wpanel);
                 a = wpanel;
             }
 

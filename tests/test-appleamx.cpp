@@ -101,7 +101,7 @@ int main(int argc, char ** argv) {
     ggml_backend_buffer_type_t buft = find_extra_buft("CPU_APPLEAMX");
     if (!buft) { printf("CPU_APPLEAMX buffer type not found\n"); return 1; }
 
-    const ggml_type types[] = { GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 };
+    const ggml_type types[] = { GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 };
     int n_fail = 0, n_tests = 0;
     if (!perf) {
         struct shape { int64_t M, K, N, N2; };

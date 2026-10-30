@@ -25,7 +25,8 @@ It adds two components, both enabled with `-DGGML_APPLEAMX=ON`:
 - **`CPU_APPLEAMX` buffer type of the CPU backend** ([src/ggml-cpu/apple-amx](src/ggml-cpu/apple-amx)): `MUL_MAT`
   weights are packed once, when they are loaded, into panels of 32 rows. Large batches dequantize a panel to f16
   and run on AMX; small batches, including token generation, use NEON dot products on the packed layout.
-  Supported weight types: F16, Q4_0, Q4_1, Q4_K, Q8_0. llama.cpp uses it automatically (`--repack 1`, the default).
+  Supported weight types: F16, Q4_0, Q4_1, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, stored at 4.5-8.5 bits per weight
+  (at most 1 bit more than the original type). llama.cpp uses it automatically (`--repack 1`, the default).
 - **`AppleAMX` backend** ([src/ggml-appleamx](src/ggml-appleamx)): an accelerator backend, like BLAS, that runs
   large `MUL_MAT` ops on AMX for weights in plain host buffers (any type with a `to_float`), packing the operands
   on every call. The minimum matrix size is set with `GGML_APPLEAMX_MIN_BATCH` (default 32).
@@ -72,7 +73,8 @@ since those backends cannot read repacked weights.
 ### Limitations
 
 - Only tested on an M1 Max. AMX is undocumented, and it is unknown whether M4 and later still support it.
-- `CPU_APPLEAMX` does not pack Q5/Q6 K-quants and the other quantization types yet; those weights stay on the CPU.
+- `CPU_APPLEAMX` does not pack Q2_K, Q3_K, the IQ types, BF16, F32 and the microscaling formats yet; those weights
+  stay on the CPU.
 - Packed weights cannot be read back from the buffer.
 - The AppleAMX backend handles only `MUL_MAT` (no `MUL_MAT_ID` or `OUT_PROD`).
 
